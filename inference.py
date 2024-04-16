@@ -44,6 +44,8 @@ parser.add_argument('--pads', nargs='+', type=int, default=[0, 10, 0, 0],
 
 parser.add_argument('--wav2lip_batch_size', type=int, help='Batch size for Wav2Lip model(s)', default=128)
 
+parser.add_argument('--face_batch_size', type=int, default=64 * 4, required=False)
+
 parser.add_argument('--resize_factor', default=1, type=int,
              help='Reduce the resolution by this factor. Sometimes, best results are obtained at 480p or 720p')
 
@@ -313,13 +315,11 @@ def do_load(checkpoint_path):
     print("Models loaded")
 
 
-face_batch_size = 64 * 8
-
 def face_rect(images):
-    num_batches = math.ceil(len(images) / face_batch_size)
+    num_batches = math.ceil(len(images) / args.face_batch_size)
     prev_ret = None
     for i in range(num_batches):
-        batch = images[i * face_batch_size: (i + 1) * face_batch_size]
+        batch = images[i * args.face_batch_size: (i + 1) * args.face_batch_size]
         all_faces = detector(batch)  # return faces list of all images
         for faces in all_faces:
             if faces:
