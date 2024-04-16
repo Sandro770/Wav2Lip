@@ -9,7 +9,7 @@ import numpy as np
 import torch
 from tqdm import tqdm
 
-import audio
+import audio as audio_module
 # from face_detect import face_rect
 from models import Wav2Lip
 
@@ -237,8 +237,8 @@ def main():
             ])
             audio = 'temp/temp.wav'
 
-        wav = audio.load_wav(audio, 16000)
-        mel = audio.melspectrogram(wav)
+        wav = audio_module.load_wav(audio, 16000)
+        mel = audio_module.melspectrogram(wav)
         print(mel.shape)
 
         if np.isnan(mel.reshape(-1)).sum() > 0:
