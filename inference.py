@@ -49,7 +49,7 @@ parser.add_argument('--face_batch_size', type=int, default=64 * 4, required=Fals
 parser.add_argument('--resize_factor', default=1, type=int,
              help='Reduce the resolution by this factor. Sometimes, best results are obtained at 480p or 720p')
 
-parser.add_argument('--out_height', default=480, type=int,
+parser.add_argument('--out_height', default=360, type=int,
             help='Output video height. Best results are obtained at 480 or 720')
 
 parser.add_argument('--crop', nargs='+', type=int, default=[0, -1, 0, -1],
