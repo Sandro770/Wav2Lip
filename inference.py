@@ -177,128 +177,211 @@ def load_model(path):
     model = model.to(device)
     return model.eval()
 
+def perform_lip_sync(face, audio, outfile):
+    if os.path.isfile(face) and face.split('.')[1] in ['jpg', 'png', 'jpeg']:
+            args.static = True
+
+    if not os.path.isfile(face):
+        raise ValueError('--face argument must be a valid path to video/image file')
+
+    elif face.split('.')[1] in ['jpg', 'png', 'jpeg']:
+        full_frames = [cv2.imread(face)]
+        fps = args.fps
+
+    else:
+        video_stream = cv2.VideoCapture(face)
+        fps = video_stream.get(cv2.CAP_PROP_FPS)
+
+        print('Reading video frames...')
+
+        full_frames = []
+        while 1:
+            still_reading, frame = video_stream.read()
+            if not still_reading:
+                video_stream.release()
+                break
+
+            aspect_ratio = frame.shape[1] / frame.shape[0]
+            frame = cv2.resize(frame, (int(args.out_height * aspect_ratio), args.out_height))
+            # if args.resize_factor > 1:
+            #     frame = cv2.resize(frame, (frame.shape[1]//args.resize_factor, frame.shape[0]//args.resize_factor))
+
+            if args.rotate:
+                frame = cv2.rotate(frame, cv2.cv2.ROTATE_90_CLOCKWISE)
+
+            y1, y2, x1, x2 = args.crop
+            if x2 == -1: x2 = frame.shape[1]
+            if y2 == -1: y2 = frame.shape[0]
+
+            frame = frame[y1:y2, x1:x2]
+
+            full_frames.append(frame)
+
+    print ("Number of frames available for inference: "+str(len(full_frames)))
+
+    if not audio.endswith('.wav'):
+        print('Extracting raw audio...')
+        # command = 'ffmpeg -y -i {} -strict -2 {}'.format(audio, 'temp/temp.wav')
+        # subprocess.call(command, shell=True)
+        subprocess.check_call([
+            "ffmpeg", "-y",
+            "-i", audio,
+            "temp/temp.wav",
+        ])
+        audio = 'temp/temp.wav'
+
+    wav = audio_module.load_wav(audio, 16000)
+    mel = audio_module.melspectrogram(wav)
+    print(mel.shape)
+
+    if np.isnan(mel.reshape(-1)).sum() > 0:
+        raise ValueError('Mel contains nan! Using a TTS voice? Add a small epsilon noise to the wav file and try again')
+
+    mel_chunks = []
+    mel_idx_multiplier = 80./fps
+    i = 0
+    while 1:
+        start_idx = int(i * mel_idx_multiplier)
+        if start_idx + mel_step_size > len(mel[0]):
+            mel_chunks.append(mel[:, len(mel[0]) - mel_step_size:])
+            break
+        mel_chunks.append(mel[:, start_idx : start_idx + mel_step_size])
+        i += 1
+
+    print("Length of mel chunks: {}".format(len(mel_chunks)))
+
+    full_frames = full_frames[:len(mel_chunks)]
+
+    batch_size = args.wav2lip_batch_size
+    gen = datagen(full_frames.copy(), mel_chunks)
+
+    s = time()
+
+    for i, (img_batch, mel_batch, frames, coords) in enumerate(tqdm(gen,
+                                            total=int(np.ceil(float(len(mel_chunks))/batch_size)))):
+        if i == 0:
+            frame_h, frame_w = full_frames[0].shape[:-1]
+            out = cv2.VideoWriter('temp/result.avi',
+                                    cv2.VideoWriter_fourcc(*'DIVX'), fps, (frame_w, frame_h))
+
+        img_batch = torch.FloatTensor(np.transpose(img_batch, (0, 3, 1, 2))).to(device)
+        mel_batch = torch.FloatTensor(np.transpose(mel_batch, (0, 3, 1, 2))).to(device)
+
+        with torch.no_grad():
+            pred = model(mel_batch, img_batch)
+
+        pred = pred.cpu().numpy().transpose(0, 2, 3, 1) * 255.
+
+        for p, f, c in zip(pred, frames, coords):
+            y1, y2, x1, x2 = c
+            p = cv2.resize(p.astype(np.uint8), (x2 - x1, y2 - y1))
+
+            f[y1:y2, x1:x2] = p
+            out.write(f)
+
+    out.release()
+
+    print("wav2lip prediction time:", time() - s)
+
+    subprocess.check_call([
+        "ffmpeg", "-y",
+        # "-vsync", "0", "-hwaccel", "cuda", "-hwaccel_output_format", "cuda",
+        "-i", "temp/result.avi",
+        "-i", audio,
+        # "-c:v", "h264_nvenc",
+        outfile,
+    ])
+
+
+def get_media_duration(filename):
+    """ Use ffmpeg to get the duration of the media file in seconds. """
+    result = subprocess.run(
+        ["ffmpeg", "-i", filename],
+        stderr=subprocess.PIPE,
+        text=True
+    )
+    lines = result.stderr.split('\n')
+    duration_line = [x for x in lines if "Duration" in x][0]
+    time_str = duration_line.split(",")[0].split("Duration:")[1].strip()
+    hours, minutes, seconds = map(float, time_str.split(':'))
+    total_seconds = hours * 3600 + minutes * 60 + seconds
+    return total_seconds
+
+def slice_media(file_path):
+    max_segment_length = 60
+    """ Slice the media file into segments of `segment_length` seconds using ffmpeg command. """
+    total_duration = get_media_duration(file_path)
+    segments = math.ceil(total_duration / max_segment_length)
+    segment_length = total_duration/segments 
+    
+    base_name = os.path.basename(file_path)
+    name, ext = os.path.splitext(base_name)
+    output_dir = f'sliced_{name}'
+    os.makedirs(output_dir, exist_ok=True)
+
+    segment_paths = []
+
+    for i in range(segments):
+        start_time = i * segment_length
+        end_time = min((i + 1) * segment_length, total_duration)
+        output_file = os.path.join(output_dir, f'{name}_{i:03d}{ext}')
+
+        cmd = [
+            "ffmpeg",
+            "-copyts",
+            "-ss", str(start_time),
+            "-i", file_path,
+            "-to", str(end_time),
+            "-y",
+            "-c", "copy",
+            output_file
+        ]
+        subprocess.run(cmd)
+        segment_paths.append(output_file)
+
+    print(f"Slicing completed: {segments} segments created in {output_dir}")
+    return segment_paths
+
+def concatenate_videos(video_paths, output_file='output.mp4'):
+    print (video_paths)
+    with open('videos_list.txt', 'w') as tmpfile:
+        concat_file = tmpfile.name
+        for path in video_paths:
+            tmpfile.write(f"file '{path}'\n")
+    
+    cmd = [
+        "ffmpeg",
+        "-f", "concat",
+        "-safe", "0",
+        "-i", concat_file,
+        "-c", "copy",
+        "-y",
+        output_file
+    ]
+    subprocess.run(cmd, check=True)
+    print(f"Videos concatenated successfully into {output_file}")
+
 def main():
     args.img_size = 96
 
     for video_index in range(0, len(args.face)):
-        face = args.face[video_index]
-        audio = args.audio[video_index]
-        outfile = args.outfile[video_index]
+        face_i = args.face[video_index]
+        audio_i = args.audio[video_index]
+        outfile_i = args.outfile[video_index]
         
-        if os.path.isfile(face) and face.split('.')[1] in ['jpg', 'png', 'jpeg']:
-            args.static = True
-
-        if not os.path.isfile(face):
-            raise ValueError('--face argument must be a valid path to video/image file')
-
-        elif face.split('.')[1] in ['jpg', 'png', 'jpeg']:
-            full_frames = [cv2.imread(face)]
-            fps = args.fps
-
-        else:
-            video_stream = cv2.VideoCapture(face)
-            fps = video_stream.get(cv2.CAP_PROP_FPS)
-
-            print('Reading video frames...')
-
-            full_frames = []
-            while 1:
-                still_reading, frame = video_stream.read()
-                if not still_reading:
-                    video_stream.release()
-                    break
-
-                aspect_ratio = frame.shape[1] / frame.shape[0]
-                frame = cv2.resize(frame, (int(args.out_height * aspect_ratio), args.out_height))
-                # if args.resize_factor > 1:
-                #     frame = cv2.resize(frame, (frame.shape[1]//args.resize_factor, frame.shape[0]//args.resize_factor))
-
-                if args.rotate:
-                    frame = cv2.rotate(frame, cv2.cv2.ROTATE_90_CLOCKWISE)
-
-                y1, y2, x1, x2 = args.crop
-                if x2 == -1: x2 = frame.shape[1]
-                if y2 == -1: y2 = frame.shape[0]
-
-                frame = frame[y1:y2, x1:x2]
-
-                full_frames.append(frame)
-
-        print ("Number of frames available for inference: "+str(len(full_frames)))
-
-        if not audio.endswith('.wav'):
-            print('Extracting raw audio...')
-            # command = 'ffmpeg -y -i {} -strict -2 {}'.format(audio, 'temp/temp.wav')
-            # subprocess.call(command, shell=True)
-            subprocess.check_call([
-                "ffmpeg", "-y",
-                "-i", audio,
-                "temp/temp.wav",
-            ])
-            audio = 'temp/temp.wav'
-
-        wav = audio_module.load_wav(audio, 16000)
-        mel = audio_module.melspectrogram(wav)
-        print(mel.shape)
-
-        if np.isnan(mel.reshape(-1)).sum() > 0:
-            raise ValueError('Mel contains nan! Using a TTS voice? Add a small epsilon noise to the wav file and try again')
-
-        mel_chunks = []
-        mel_idx_multiplier = 80./fps
-        i = 0
-        while 1:
-            start_idx = int(i * mel_idx_multiplier)
-            if start_idx + mel_step_size > len(mel[0]):
-                mel_chunks.append(mel[:, len(mel[0]) - mel_step_size:])
-                break
-            mel_chunks.append(mel[:, start_idx : start_idx + mel_step_size])
-            i += 1
-
-        print("Length of mel chunks: {}".format(len(mel_chunks)))
-
-        full_frames = full_frames[:len(mel_chunks)]
-
-        batch_size = args.wav2lip_batch_size
-        gen = datagen(full_frames.copy(), mel_chunks)
-
-        s = time()
-
-        for i, (img_batch, mel_batch, frames, coords) in enumerate(tqdm(gen,
-                                                total=int(np.ceil(float(len(mel_chunks))/batch_size)))):
-            if i == 0:
-                frame_h, frame_w = full_frames[0].shape[:-1]
-                out = cv2.VideoWriter('temp/result.avi',
-                                        cv2.VideoWriter_fourcc(*'DIVX'), fps, (frame_w, frame_h))
-
-            img_batch = torch.FloatTensor(np.transpose(img_batch, (0, 3, 1, 2))).to(device)
-            mel_batch = torch.FloatTensor(np.transpose(mel_batch, (0, 3, 1, 2))).to(device)
-
-            with torch.no_grad():
-                pred = model(mel_batch, img_batch)
-
-            pred = pred.cpu().numpy().transpose(0, 2, 3, 1) * 255.
-
-            for p, f, c in zip(pred, frames, coords):
-                y1, y2, x1, x2 = c
-                p = cv2.resize(p.astype(np.uint8), (x2 - x1, y2 - y1))
-
-                f[y1:y2, x1:x2] = p
-                out.write(f)
-
-        out.release()
-
-        print("wav2lip prediction time:", time() - s)
-
-        subprocess.check_call([
-            "ffmpeg", "-y",
-            # "-vsync", "0", "-hwaccel", "cuda", "-hwaccel_output_format", "cuda",
-            "-i", "temp/result.avi",
-            "-i", audio,
-            # "-c:v", "h264_nvenc",
-            outfile,
-        ])
-
+        faces = slice_media(face_i)
+        audios = slice_media(audio_i)
+        part_i = 0
+        out_paths = []
+        for face, audio in zip(faces, audios):
+            base_name = os.path.basename(outfile_i)
+            name, ext = os.path.splitext(base_name)
+            out_file_tmp_path = name+str(part_i)+ext 
+            part_i += 1
+            perform_lip_sync(face, audio, out_file_tmp_path)
+            out_paths.append(out_file_tmp_path)
+        concatenate_videos(out_paths, outfile_i)
+        
 model = detector = detector_model = None
 
 def do_load(checkpoint_path):
