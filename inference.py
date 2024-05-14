@@ -307,10 +307,12 @@ def get_media_duration(filename):
     total_seconds = hours * 3600 + minutes * 60 + seconds
     return total_seconds
 
-def slice_media(file_path, segment_length=60):
+def slice_media(file_path):
+    max_segment_length = 60
     """ Slice the media file into segments of `segment_length` seconds using ffmpeg command. """
     total_duration = get_media_duration(file_path)
-    segments = math.ceil(total_duration / segment_length)
+    segments = math.ceil(total_duration / max_segment_length)
+    segment_length = total_duration/segments 
     
     base_name = os.path.basename(file_path)
     name, ext = os.path.splitext(base_name)
@@ -321,12 +323,16 @@ def slice_media(file_path, segment_length=60):
 
     for i in range(segments):
         start_time = i * segment_length
+        end_time = min((i + 1) * segment_length, total_duration)
         output_file = os.path.join(output_dir, f'{name}_{i:03d}{ext}')
+
         cmd = [
             "ffmpeg",
-            "-i", file_path,
+            "-copyts",
             "-ss", str(start_time),
-            "-t", str(segment_length),
+            "-i", file_path,
+            "-to", str(end_time),
+            "-y",
             "-c", "copy",
             output_file
         ]
@@ -336,15 +342,20 @@ def slice_media(file_path, segment_length=60):
     print(f"Slicing completed: {segments} segments created in {output_dir}")
     return segment_paths
 
-
-def concatenate_videos(concat_file, output_file='output.mp4'):
-    """Use ffmpeg to concatenate videos specified in the concat file."""
+def concatenate_videos(video_paths, output_file='output.mp4'):
+    print (video_paths)
+    with open('videos_list.txt', 'w') as tmpfile:
+        concat_file = tmpfile.name
+        for path in video_paths:
+            tmpfile.write(f"file '{path}'\n")
+    
     cmd = [
         "ffmpeg",
         "-f", "concat",
         "-safe", "0",
         "-i", concat_file,
         "-c", "copy",
+        "-y",
         output_file
     ]
     subprocess.run(cmd, check=True)
@@ -360,12 +371,12 @@ def main():
         
         faces = slice_media(face_i)
         audios = slice_media(audio_i)
-        print (len(faces) + "  " + len(audios))
-        assert len(faces) == len(audios)
         part_i = 0
         out_paths = []
         for face, audio in zip(faces, audios):
-            out_file_tmp_path = outfile_i+str(part_i)
+            base_name = os.path.basename(outfile_i)
+            name, ext = os.path.splitext(base_name)
+            out_file_tmp_path = name+str(part_i)+ext 
             part_i += 1
             perform_lip_sync(face, audio, out_file_tmp_path)
             out_paths.append(out_file_tmp_path)
